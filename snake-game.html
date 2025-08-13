@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Snake — HTML5 Canvas</title>
+  <style>
+    :root{
+      --bg:#0f172a;        /* slate-900 */
+      --panel:#111827;     /* gray-900 */
+      --muted:#94a3b8;     /* slate-400 */
+      --accent:#22d3ee;    /* cyan-400 */
+      --accent2:#f97316;   /* orange-500 */
+      --good:#34d399;      /* emerald-400 */
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:var(--bg);color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial}
+    .wrap{max-width:900px;margin:auto;padding:18px;display:grid;gap:16px}
+    header{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+    .hud{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+    .pill{background:var(--panel);padding:8px 12px;border-radius:999px;border:1px solid #1f2937}
+    .controls{display:flex;gap:10px;align-items:center}
+    button,.toggle{background:var(--panel);color:#e5e7eb;border:1px solid #1f2937;border-radius:10px;padding:8px 12px;cursor:pointer}
+    button:hover{filter:brightness(1.1)}
+    label{color:var(--muted);font-size:14px;display:flex;gap:8px;align-items:center}
+    input[type="range"]{accent-color:var(--accent)}
+
+    .stage{display:grid;grid-template-columns:1fr;gap:12px}
+    .canvas-wrap{position:relative;margin:auto;width:min(92vmin,680px)}
+    canvas{width:100%;height:auto;background:#0b1022;border:2px solid #1f2937;border-radius:16px;display:block;touch-action:none}
+
+    /* On-screen D‑pad for mobile */
+    .dpad{position:absolute;bottom:12px;left:12px;display:grid;grid-template-columns:56px 56px 56px;grid-template-rows:56px 56px 56px;gap:8px;opacity:.85}
+    .dpad button{width:56px;height:56px;display:grid;place-items:center;font-weight:700}
+    .dpad .blank{visibility:hidden}
+
+    .legend{color:var(--muted);font-size:13px;text-align:center}
+
+    .overlay{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
+    .overlay .card{background:rgba(2,6,23,.75);backdrop-filter:blur(6px);padding:22px 26px;border-radius:16px;border:1px solid #1f2937;text-align:center}
+    .overlay h2{margin:0 0 6px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="hud">
+        <div class="pill" id="score">Score: 0</div>
+        <div class="pill" id="best">Best: 0</div>
+      </div>
+      <div class="controls">
+        <label>Speed <input id="speed" type="range" min="4" max="20" value="10"></label>
+        <label class="toggle"><input id="wrap" type="checkbox"> Wrap walls</label>
+        <button id="pause">Pause (Space)</button>
+        <button id="reset">Reset (R)</button>
+      </div>
+    </header>
+
+    <section class="stage">
+      <div class="canvas-wrap">
+        <canvas id="game" width="512" height="512"></canvas>
+        <!-- D‑pad -->
+        <div class="dpad" id="dpad">
+          <button class="blank" tabindex="-1"></button>
+          <button data-dir="up">▲</button>
+          <button class="blank" tabindex="-1"></button>
+          <button data-dir="left">◀</button>
+          <button class="blank" tabindex="-1"></button>
+          <button data-dir="right">▶</button>
+          <button class="blank" tabindex="-1"></button>
+          <button data-dir="down">▼</button>
+          <button class="blank" tabindex="-1"></button>
+        </div>
+        <!-- Overlays (pause / game over) -->
+        <div class="overlay" id="overlay" hidden>
+          <div class="card">
+            <h2 id="overlayTitle">Paused</h2>
+            <div class="legend">Press Space to resume</div>
+          </div>
+        </div>
+      </div>
+      <div class="legend">Controls: Arrow Keys / WASD / Swipe / D‑pad · Eat apples, avoid yourself. </div>
+    </section>
+  </div>
+
+  <script>
+    // ===== Canvas setup (crisp on HiDPI) =====
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    function resizeCanvas(){
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const cssSize = canvas.clientWidth; // set via CSS
+      const px = Math.floor(cssSize * dpr);
+      canvas.width = px;
+      canvas.height = px;
+      // Scale drawing so 1 unit = tile size; we handle tile->px manually, so reset transform
+      ctx.setTransform(1,0,0,1,0,0);
+    }
+    new ResizeObserver(resizeCanvas).observe(canvas);
+
+    // ===== Game constants =====
+    const GRID = 24;                   // grid cells (GRID x GRID)
+    const BG = '#0b1022';
+    const GRID_LINE = 'rgba(148,163,184,0.08)';
+    const HEAD = '#22d3ee';
+    const BODY = '#67e8f9';
+    const APPLE = '#f97316';
+
+    // speed: moves per second; controlled by slider
+    const speedInput = document.getElementById('speed');
+    const wrapToggle = document.getElementById('wrap');
+    const pauseBtn = document.getElementById('pause');
+    const resetBtn = document.getElementById('reset');
+    const scoreEl = document.getElementById('score');
+    const bestEl = document.getElementById('best');
+    const overlay = document.getElementById('overlay');
+    const overlayTitle = document.getElementById('overlayTitle');
+
+    const BEST_KEY = 'snake_best_v1';
+    let best = Number(localStorage.getItem(BEST_KEY) || 0);
+    bestEl.textContent = 'Best: ' + best;
+
+    // ===== Game state =====
+    let snake, dir, dirQueue, apple, score, gameOver, paused;
+
+    function init(){
+      const start = Math.floor(GRID/2);
+      snake = [ {x:start-1,y:start}, {x:start,y:start}, {x:start+1,y:start} ]; // head is last
+      dir = {x:1,y:0};
+      dirQueue = [];
+      apple = spawnApple();
+      score = 0; gameOver = false; paused = false;
+      scoreEl.textContent = 'Score: ' + score;
+      overlay.hidden = true;
+    }
+
+    function spawnApple(){
+      while(true){
+        const a = { x: Math.floor(Math.random()*GRID), y: Math.floor(Math.random()*GRID) };
+        if (!snake.some(s => s.x===a.x && s.y===a.y)) return a;
+      }
+    }
+
+    function enqueueDir(nx, ny){
+      // prevent reversing into itself: disallow if same tick opposite
+      const last = dirQueue.length ? dirQueue[dirQueue.length-1] : dir;
+      if (last.x + nx === 0 && last.y + ny === 0) return;
+      dirQueue.push({x:nx,y:ny});
+    }
+
+    // Input — keyboard
+    window.addEventListener('keydown', e => {
+      const k = e.key.toLowerCase();
+      if (k === 'arrowleft' || k==='a') enqueueDir(-1,0);
+      else if (k === 'arrowright' || k==='d') enqueueDir(1,0);
+      else if (k === 'arrowup' || k==='w') enqueueDir(0,-1);
+      else if (k === 'arrowdown' || k==='s') enqueueDir(0,1);
+      else if (k === ' ') togglePause();
+      else if (k === 'r') { init(); }
+    });
+
+    // Input — D‑pad buttons
+    document.getElementById('dpad').addEventListener('pointerdown', (e)=>{
+      const b = e.target.closest('[data-dir]');
+      if(!b) return;
+      const v = b.getAttribute('data-dir');
+      if (v==='up') enqueueDir(0,-1);
+      if (v==='down') enqueueDir(0,1);
+      if (v==='left') enqueueDir(-1,0);
+      if (v==='right') enqueueDir(1,0);
+      e.preventDefault();
+    });
+
+    // Input — swipe
+    let touchStart=null;
+    canvas.addEventListener('pointerdown',e=>{touchStart={x:e.clientX,y:e.clientY};});
+    window.addEventListener('pointerup',e=>{
+      if(!touchStart) return;
+      const dx=e.clientX-touchStart.x, dy=e.clientY-touchStart.y;
+      if (Math.hypot(dx,dy)>18){
+        if (Math.abs(dx)>Math.abs(dy)) enqueueDir(Math.sign(dx),0); else enqueueDir(0,Math.sign(dy));
+      }
+      touchStart=null;
+    });
+
+    // UI controls
+    pauseBtn.addEventListener('click', togglePause);
+    resetBtn.addEventListener('click', ()=>init());
+
+    function togglePause(){
+      if (gameOver) return;
+      paused = !paused;
+      overlay.hidden = !paused;
+      overlayTitle.textContent = paused ? 'Paused' : '';
+    }
+
+    // ===== Game loop (fixed-timestep by accumulator) =====
+    let last=0, acc=0;
+    function loop(ts){
+      const dt = Math.min(0.05, (ts - last)/1000 || 0.016);
+      last = ts; acc += dt;
+
+      const movesPerSec = Number(speedInput.value);
+      const step = 1 / movesPerSec; // seconds per move
+
+      while(acc >= step){
+        if (!paused && !gameOver) tick();
+        acc -= step;
+      }
+
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    function tick(){
+      // apply pending direction once per tick
+      if (dirQueue.length) dir = dirQueue.shift();
+
+      const head = snake[snake.length-1];
+      let nx = head.x + dir.x;
+      let ny = head.y + dir.y;
+
+      // walls / wrap
+      if (wrapToggle.checked){
+        nx = (nx + GRID) % GRID;
+        ny = (ny + GRID) % GRID;
+      } else {
+        if (nx < 0 || nx >= GRID || ny < 0 || ny >= GRID){
+          endGame(); return;
+        }
+      }
+
+      const newHead = {x:nx,y:ny};
+
+      // Self-collision: exclude tail if not eating
+      let eating = (nx===apple.x && ny===apple.y);
+      const bodyToCheck = eating ? snake : snake.slice(1); // tail will move off if not eating
+      if (bodyToCheck.some(s => s.x===nx && s.y===ny)) { endGame(); return; }
+
+      snake.push(newHead);
+      if (eating){
+        score += 10; scoreEl.textContent = 'Score: ' + score; apple = spawnApple();
+      } else {
+        snake.shift(); // move forward: remove tail
+      }
+    }
+
+    function endGame(){
+      gameOver = true;
+      paused = true;
+      if (score > best){ best = score; localStorage.setItem(BEST_KEY, best); bestEl.textContent = 'Best: ' + best; }
+      overlay.hidden = false; overlayTitle.textContent = 'Game Over';
+    }
+
+    // ===== Rendering =====
+    function draw(){
+      const size = Math.min(canvas.width, canvas.height);
+      const tile = Math.floor(size / GRID);
+      const off = Math.floor((size - tile*GRID)/2); // center if not divisible
+
+      // bg
+      ctx.fillStyle = BG; ctx.fillRect(0,0,size,size);
+
+      // grid
+      ctx.strokeStyle = GRID_LINE; ctx.lineWidth = 1; ctx.beginPath();
+      for(let i=0;i<=GRID;i++){ const p=off+i*tile; ctx.moveTo(off,p); ctx.lineTo(off+GRID*tile,p); ctx.moveTo(p,off); ctx.lineTo(p,off+GRID*tile);} 
+      ctx.stroke();
+
+      // apple
+      drawCell(apple.x, apple.y, APPLE);
+
+      // snake
+      for (let i=0;i<snake.length;i++){
+        const c = snake[i];
+        const isHead = i===snake.length-1;
+        drawCell(c.x, c.y, isHead ? HEAD : BODY, isHead);
+      }
+
+      // paused overlay hint handled by DOM overlay
+    }
+
+    function drawCell(x,y,color,isHead=false){
+      const size = Math.min(canvas.width, canvas.height);
+      const tile = Math.floor(size / GRID);
+      const off = Math.floor((size - tile*GRID)/2);
+      const px = off + x*tile;
+      const py = off + y*tile;
+      const r = Math.max(3, Math.floor(tile*0.22));
+      // rounded rect
+      ctx.fillStyle = color;
+      roundRect(ctx, px+1, py+1, tile-2, tile-2, r);
+      ctx.fill();
+
+      if (isHead){
+        // tiny eyes
+        ctx.fillStyle = '#0b1022';
+        const eye = Math.max(1, Math.floor(tile*0.07));
+        ctx.fillRect(px + Math.floor(tile*0.28), py + Math.floor(tile*0.28), eye, eye);
+        ctx.fillRect(px + Math.floor(tile*0.62), py + Math.floor(tile*0.28), eye, eye);
+      }
+    }
+
+    function roundRect(ctx, x, y, w, h, r){
+      const rr = Math.min(r, w/2, h/2);
+      ctx.beginPath();
+      ctx.moveTo(x+rr, y);
+      ctx.arcTo(x+w, y, x+w, y+h, rr);
+      ctx.arcTo(x+w, y+h, x, y+h, rr);
+      ctx.arcTo(x, y+h, x, y, rr);
+      ctx.arcTo(x, y, x+w, y, rr);
+      ctx.closePath();
+    }
+
+    // Start
+    resizeCanvas();
+    init();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
